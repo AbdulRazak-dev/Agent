@@ -482,6 +482,175 @@ const song=document.getElementById("song");
 const SpeechRecognition=window.SpeechRecognition||window.webkitSpeechRecognition;
 let youtubeTab=null;
 let listening=false;
+let isProcessing=false; // guards against overlapping /youtube/play requests
+
+/* ==================================================================
+   INTENT DETECTION LAYER
+   Local, rule-based classifier that decides whether a spoken
+   transcript is actually a music request BEFORE anything is sent
+   to the backend. Kept modular (single entry point:
+   detectVoiceIntent) so it can later be swapped for a real NLP/AI
+   classifier without touching the rest of the app.
+   ================================================================== */
+
+// Wake-word style prefixes that can be safely stripped before analysis
+const FILLER_PREFIXES=["hey nova","ok nova","okay nova","nova"];
+
+// Sports/activities that make "play X" NOT a music request,
+// unless a music-related word is also present ("play football songs")
+const NON_MUSIC_ACTIVITIES=[
+    "football","cricket","soccer","basketball","tennis","hockey",
+    "baseball","chess","golf","rugby","volleyball","cards","games","video games"
+];
+
+const MUSIC_HINT_WORDS=/\b(song|songs|music|track|tracks|album|playlist|tune|tunes)\b/i;
+
+// Explicit, imperative-style music commands. Each has one capture
+// group containing the raw query to be cleaned and sent onward.
+const EXPLICIT_MUSIC_PATTERNS=[
+    /^(?:can|could)(?:n't| not)? you play (.+?)\??$/i,
+    /^(?:would you |will you |please )?play (.+?)\??$/i,
+    /^put on (.+?)\??$/i,
+    /^start playing (.+?)\??$/i,
+    /^i want to (?:hear|listen to) (.+?)\??$/i,
+    /^i(?:'d| would) like to (?:hear|listen to) (.+?)\??$/i,
+    /^find me (.+?)\??$/i,
+    /^search (?:for )?(.+?)\??$/i,
+    /^queue up (.+?)\??$/i
+];
+
+// Sentences that merely mention "play" but describe an activity,
+// not a music request (e.g. "I play football every weekend")
+const NEGATIVE_MUSIC_PATTERNS=[
+    /^i(?:'m| am)? (?:play|playing|going to play|gonna play)\b/i,
+    /what time does .* play/i,
+    /where can i play\b/i,
+    /don'?t play\b/i,
+    /\bnot? play(ing)?\b/i
+];
+
+const STOP_PATTERNS=[
+    /^stop( the)? music$/i,
+    /^stop playing$/i,
+    /^stop$/i,
+    /^pause$/i
+];
+
+const CANCEL_PATTERNS=[
+    /^cancel( that)?$/i,
+    /^never ?mind$/i,
+    /^forget it$/i,
+    /^i don'?t want (?:music|that|any music)$/i,
+    /^don'?t play (?:music|anything)$/i
+];
+
+// Small talk / capability questions Nova answers locally — never hits the API
+const SMALL_TALK=[
+    {pattern:/^(hi|hello|hey)( there)?( nova)?$/i, reply:"Hey! I'm Nova. Say \"play\" followed by a song."},
+    {pattern:/how are you/i, reply:"I'm doing great. What would you like to listen to?"},
+    {pattern:/what can you do/i, reply:"I can play music using your voice. Try saying \"Play Blinding Lights\"."},
+    {pattern:/tell me a joke/i, reply:"I only know musical jokes — ask me to play a song instead!"},
+    {pattern:/what'?s the weather/i, reply:"I can't check the weather, but I can play something for you."},
+    {pattern:/^who is\b/i, reply:"I'm just a music assistant, so I can't answer that — but I can play a song."},
+    {pattern:/^(tell me about|what is|what's)\b/i, reply:"I'm just a music assistant, so I can't answer that — but I can play a song."},
+    {pattern:/open google/i, reply:"I can't open other apps, but I can play music for you."}
+];
+
+// Strip trailing punctuation and wake-word prefixes while preserving
+// the original casing of the rest of the sentence.
+function normalizeTranscript(raw){
+    let t=(raw||"").trim();
+    t=t.replace(/[.?!]+$/g,"").trim();
+    for(const prefix of FILLER_PREFIXES){
+        const re=new RegExp("^"+prefix+"[,\\s]+","i");
+        t=t.replace(re,"").trim();
+    }
+    return t;
+}
+
+// Strip leading filler words picked up inside an explicit match
+// ("play the song Perfect" -> "Perfect")
+function cleanQuery(raw){
+    let q=raw.trim();
+    q=q.replace(/^(the song|songs by|some|something from)\s+/i,"");
+    q=q.replace(/\s+please$/i,"");
+    q=q.replace(/^["']|["']$/g,"");
+    return q.trim();
+}
+
+function isNonMusicActivity(query){
+    const q=query.toLowerCase().trim();
+    if(MUSIC_HINT_WORDS.test(q))return false;
+    return NON_MUSIC_ACTIVITIES.some(a=>q===a||q.startsWith(a+" ")||q.endsWith(" "+a));
+}
+
+function detectVoiceIntent(transcript){
+    const original=(transcript||"").trim();
+
+    if(!original){
+        return {intent:"UNKNOWN", query:null, confidence:0};
+    }
+
+    const text=normalizeTranscript(original);
+
+    if(!text){
+        return {intent:"UNKNOWN", query:null, confidence:0};
+    }
+
+    // 1. Stop
+    if(STOP_PATTERNS.some(p=>p.test(text))){
+        return {intent:"STOP", query:null, confidence:0.95};
+    }
+
+    // 2. Cancel
+    if(CANCEL_PATTERNS.some(p=>p.test(text))){
+        return {intent:"CANCEL", query:null, confidence:0.95};
+    }
+
+    // 3. Sentences that mention "play" but describe an activity, not music
+    if(!MUSIC_HINT_WORDS.test(text) && NEGATIVE_MUSIC_PATTERNS.some(p=>p.test(text))){
+        return {intent:"UNKNOWN", query:null, confidence:0.1};
+    }
+
+    // 4. Small talk / capability questions -> handled locally
+    for(const entry of SMALL_TALK){
+        if(entry.pattern.test(text)){
+            return {intent:"HELP", query:null, confidence:0.9, reply:entry.reply};
+        }
+    }
+
+    // 5. Explicit music commands
+    for(const pattern of EXPLICIT_MUSIC_PATTERNS){
+        const match=text.match(pattern);
+        if(match && match[match.length-1]){
+            const query=cleanQuery(match[match.length-1]);
+            if(!query)continue;
+
+            if(isNonMusicActivity(query)){
+                return {intent:"UNKNOWN", query:null, confidence:0.15};
+            }
+
+            return {intent:"PLAY_MUSIC", query, confidence:0.95};
+        }
+    }
+
+    // 6. Naked song references with strong music cues ("X by Y", "X songs")
+    if(/ by /i.test(text)){
+        return {intent:"PLAY_MUSIC", query:cleanQuery(text), confidence:0.75};
+    }
+    if(MUSIC_HINT_WORDS.test(text)){
+        return {intent:"PLAY_MUSIC", query:cleanQuery(text), confidence:0.7};
+    }
+
+    // 7. Everything else is ambiguous — never autoplay on a guess
+    return {intent:"UNKNOWN", query:null, confidence:0.2};
+}
+
+/* ==================================================================
+   SPEECH RECOGNITION + UI WIRING
+   (existing mic button, animations, status/song elements, and the
+   /youtube/play + NovaYouTube tab behavior are all preserved)
+   ================================================================== */
 
 if(!SpeechRecognition){
     status.textContent="Speech recognition unavailable";
@@ -496,6 +665,7 @@ if(!SpeechRecognition){
         listening=true;
         mic.classList.add("listening");
         status.textContent="Listening...";
+        song.textContent="";
     };
 
     recognition.onend=()=>{
@@ -506,52 +676,110 @@ if(!SpeechRecognition){
     recognition.onerror=()=>{
         listening=false;
         mic.classList.remove("listening");
-        status.textContent="Try again";
+        status.textContent="I couldn't understand that";
     };
 
     recognition.onresult=async(event)=>{
-        const command=event.results[0][0].transcript.trim();
+        const transcript=event.results[0][0].transcript.trim();
 
-        if(!command){
+        if(!transcript){
             status.textContent="No song detected";
             return;
         }
 
-        song.textContent=command;
-        status.textContent="Finding song...";
+        status.textContent="Understanding...";
+        await wait(220);
 
-        try{
-            const response=await fetch("/youtube/play",{
-                method:"POST",
-                headers:{"Content-Type":"application/json"},
-                body:JSON.stringify({command:command})
-            });
+        status.textContent=`I heard: "${transcript}"`;
+        await wait(320);
 
-            const data=await response.json();
-
-            if(!data.success){
-                status.textContent=data.message||"Song not found";
-                return;
-            }
-
-            if(!youtubeTab||youtubeTab.closed){
-                youtubeTab=window.open(data.url,"NovaYouTube");
-            }else{
-                youtubeTab.location.href=data.url;
-                youtubeTab.focus();
-            }
-
-            status.textContent="Playing";
-        }catch(error){
-            console.error(error);
-            status.textContent="Server connection failed";
-        }
+        const result=detectVoiceIntent(transcript);
+        await handleIntent(result);
     };
 
     mic.onclick=()=>{
-        if(listening)return;
+        if(listening||isProcessing)return;
         try{recognition.start();}catch(error){console.log(error);}
     };
+}
+
+function wait(ms){
+    return new Promise(resolve=>setTimeout(resolve,ms));
+}
+
+async function handleIntent(result){
+    switch(result.intent){
+        case "STOP":
+            handleStop();
+            return;
+        case "CANCEL":
+            song.textContent="";
+            status.textContent="Cancelled.";
+            return;
+        case "HELP":
+            song.textContent="";
+            status.textContent=result.reply||"I can play music using your voice.";
+            return;
+        case "PLAY_MUSIC":
+            await playMusic(result.query);
+            return;
+        case "UNKNOWN":
+        default:
+            song.textContent="";
+            status.textContent="I didn't detect a music request. Try saying \"Play <song name>\".";
+            return;
+    }
+}
+
+function handleStop(){
+    song.textContent="";
+    if(youtubeTab && !youtubeTab.closed){
+        try{
+            youtubeTab.location.href="about:blank";
+        }catch(error){
+            console.log(error);
+        }
+        status.textContent="Stopped.";
+    }else{
+        status.textContent="Nothing is playing.";
+    }
+}
+
+async function playMusic(query){
+    if(isProcessing)return; // prevent overlapping /youtube/play requests
+    isProcessing=true;
+
+    song.textContent=query;
+    status.textContent=`Finding "${query}"...`;
+
+    try{
+        const response=await fetch("/youtube/play",{
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify({command:query})
+        });
+
+        const data=await response.json();
+
+        if(!data.success){
+            status.textContent=data.message||"Song not found";
+            return;
+        }
+
+        if(!youtubeTab||youtubeTab.closed){
+            youtubeTab=window.open(data.url,"NovaYouTube");
+        }else{
+            youtubeTab.location.href=data.url;
+            youtubeTab.focus();
+        }
+
+        status.textContent="Playing";
+    }catch(error){
+        console.error(error);
+        status.textContent="Server connection failed";
+    }finally{
+        isProcessing=false;
+    }
 }
 </script>
 
