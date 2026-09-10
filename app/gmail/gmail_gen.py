@@ -12,7 +12,7 @@ MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 def generate_email_with_gemini(command):
   if not API_KEY:
     raise RuntimeError("GEMINI_API_KEY is missing.")
-  prompt = f """ 
+  prompt = f""" 
   You are a professional Gmail writing assistant.
   convert the user's voice command into a professional email.
 
